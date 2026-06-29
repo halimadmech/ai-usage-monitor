@@ -1,0 +1,21 @@
+# PyInstaller / build output
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# Python environments
+.venv/
+venv/
+env/
+
+# App runtime / local files (never commit these)
+*.credentials.json
+.credentials.json
+usage_monitor_claude_test.txt
+.usage_monitor_state.json
+
+# OS noise
+Thumbs.db
+.DS_Store
