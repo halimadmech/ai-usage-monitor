@@ -2,26 +2,33 @@
 AI Usage Monitor
 ================
 A compact desktop widget showing Claude Code and Codex CLI usage in one window:
-live limit bars per provider plus estimated cost and tokens for Today,
-Yesterday, and the Last 30 Days.
+live limit bars per provider plus tokens used for Today, Yesterday, and the
+Last 30 Days.
 
 Data sources (all local / your own account):
 - Codex limits + tokens : read from Codex CLI's local logs.
-- Claude limits         : read from Claude Code's own usage endpoint using the
+- Claude limits (%)      : read from Claude Code's own usage endpoint using the
                           OAuth token that `claude` stores after you log in.
-- Claude tokens/cost    : read from Claude Code's local session logs.
+                          This is account-wide: it covers ALL Claude usage
+                          (chat, Cowork, Claude Code, CLI), not just the CLI.
+- Claude tokens         : read from Claude Code's local session logs (this PC
+                          only; Claude chat usage is never logged locally).
 
 Nothing is sent anywhere except your own authenticated request to Anthropic's
 usage endpoint, exactly as Claude Code itself does.
 
 Run:           python usage_monitor.py
-Build:         see build_exe.bat (standalone UsageMonitor.exe)
-Diagnose:      UsageMonitor.exe --test-claude   (writes a report you can read)
+Build:         see build_exe.bat (standalone AIUsage.exe)
+Diagnose:      AIUsage.exe --test-claude   (writes a report you can read)
 """
 
+import base64
+import glob
 import json
 import os
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -39,8 +46,11 @@ from pathlib import Path
 REFRESH_SECONDS = 15          # how often the window re-reads local data
 PREFERRED_PORT = 8765
 
-WINDOW_WIDTH = 420
-WINDOW_HEIGHT = 700
+WINDOW_WIDTH = 380            # snug around the card (the card fills this minus a small gap)
+WINDOW_HEIGHT = 700           # fallback only; at launch this is set from WINDOW_FRACTION
+WINDOW_FRACTION = 0.667       # widget height as a fraction of the screen height (~2/3)
+WINDOW_MIN_HEIGHT = 300
+WINDOW_MAX_HEIGHT = 2000
 ALWAYS_ON_TOP = False         # True pins the window above others, widget-style
 
 # Claude usage endpoint (the same one Claude Code uses). The User-Agent header
@@ -52,40 +62,15 @@ CLAUDE_UA = "claude-code/2.1.114"
 CLAUDE_POLL_SECONDS = 300
 CLAUDE_CREDS = Path.home() / ".claude" / ".credentials.json"
 
-# Estimated USD per 1,000,000 tokens. ROUGH ESTIMATES for reference only.
-PRICING = {
-    "opus":   (15.0, 75.0, 18.75, 1.50),
-    "sonnet": (3.0,  15.0,  3.75, 0.30),
-    "haiku":  (0.80,  4.0,  1.00, 0.08),
-    "gpt-5":  (1.25, 10.0,  1.25, 0.125),
-    "codex":  (1.25, 10.0,  1.25, 0.125),
-    "o4":     (1.10,  4.4,  1.10, 0.275),
-    "_default": (3.0, 15.0, 3.75, 0.30),
-}
-
 CLAUDE_LOG_DIR = Path.home() / ".claude" / "projects"
 CODEX_LOG_DIRS = [Path.home() / ".codex" / "sessions", Path.home() / ".codex"]
+CODEX_AUTH = Path.home() / ".codex" / "auth.json"
 STATE_FILE = Path.home() / ".usage_monitor_state.json"  # welcome marker only
 
 
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
-
-def price_for(model):
-    if not model:
-        return PRICING["_default"]
-    m = model.lower()
-    for key, rates in PRICING.items():
-        if key != "_default" and key in m:
-            return rates
-    return PRICING["_default"]
-
-
-def cost_of(model, inp, out, cw, cr):
-    pin, pout, pcw, pcr = price_for(model)
-    return (inp * pin + out * pout + cw * pcw + cr * pcr) / 1_000_000.0
-
 
 def parse_ts(value):
     if value is None:
@@ -128,7 +113,7 @@ def fmt_reset(seconds):
 
 
 # --------------------------------------------------------------------------
-# local log parsers (tokens + cost rows; Codex limits)
+# local log parsers (token rows; Codex limits)
 # --------------------------------------------------------------------------
 
 def parse_claude():
@@ -161,11 +146,9 @@ def parse_claude():
                     cr = int(usage.get("cache_read_input_tokens", 0) or 0)
                     if inp == out == cw == cr == 0:
                         continue
-                    model = msg.get("model") or row.get("model")
                     events.append({
                         "ts": parse_ts(row.get("timestamp")),
                         "input": inp, "output": out, "cache_w": cw, "cache_r": cr,
-                        "cost": cost_of(model, inp, out, cw, cr),
                     })
         except Exception:
             continue
@@ -215,9 +198,6 @@ def parse_codex():
                     out = int(block.get("output_tokens", 0) or 0)
                     cr = int(block.get("cached_input_tokens",
                              block.get("cache_read_input_tokens", 0)) or 0)
-                    model = (row.get("model")
-                             or (info.get("model") if isinstance(info, dict) else None)
-                             or "codex")
                     ts = parse_ts(row.get("timestamp") or row.get("ts"))
                     if field == "total_token_usage":
                         if last_cumulative is None:
@@ -233,7 +213,6 @@ def parse_codex():
                     events.append({
                         "ts": ts, "input": inp, "output": out,
                         "cache_w": 0, "cache_r": cr,
-                        "cost": cost_of(model, inp, out, 0, cr),
                     })
         except Exception:
             continue
@@ -286,6 +265,25 @@ def codex_limit_bars(rl):
                     "percent_left": max(0, min(100, round(100 - float(used)))),
                     "resets": fmt_reset(b.get("resets_in_seconds"))})
     return out
+
+
+def read_codex_plan():
+    """Friendly Codex plan label like 'ChatGPT Plus', read locally from the
+    id_token in ~/.codex/auth.json. Only the plan-type claim is used."""
+    try:
+        data = json.loads(CODEX_AUTH.read_text(encoding="utf-8"))
+        tok = (data.get("tokens") or {}).get("id_token") or ""
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        auth = claims.get("https://api.openai.com/auth") or {}
+        plan = (auth.get("chatgpt_plan_type") or "").lower()
+    except Exception:
+        return None
+    label = {"plus": "Plus", "pro": "Pro", "team": "Team", "business": "Business",
+             "enterprise": "Enterprise", "edu": "Edu", "free": "Free"}.get(
+        plan, plan.title() if plan else "")
+    return ("ChatGPT " + label) if label else None
 
 
 # --------------------------------------------------------------------------
@@ -386,17 +384,88 @@ def refresh_claude_usage():
 
 
 def claude_usage_loop():
+    # Poll the local token file cheaply (every few seconds, no network) and only
+    # call the usage endpoint when the token first appears / changes (e.g. right
+    # after sign-in or a refresh) or on the normal slow cadence. This keeps us
+    # well under the endpoint's rate limit while still showing the bars within a
+    # few seconds of the user signing in.
+    last_tok = None
+    last_fetch = 0.0
     while True:
-        try:
-            refresh_claude_usage()
-        except Exception:
-            pass
-        time.sleep(CLAUDE_POLL_SECONDS)
+        tok, _ = read_claude_token()
+        now = time.time()
+        if (tok and tok != last_tok) or (now - last_fetch >= CLAUDE_POLL_SECONDS):
+            try:
+                refresh_claude_usage()
+            except Exception:
+                pass
+            last_tok = tok
+            last_fetch = now
+        time.sleep(5)
 
 
 def get_claude_limits():
     with _claude_lock:
         return list(_claude_cache["limits"]), _claude_cache["status"]
+
+
+# --------------------------------------------------------------------------
+# one-click sign-in (drives the OFFICIAL `claude` binary, no terminal needed)
+# --------------------------------------------------------------------------
+
+def find_claude_binary():
+    """Locate a real `claude` executable: PATH first, then the binary that the
+    Claude desktop app bundles, then the standard CLI install path."""
+    exe = shutil.which("claude")
+    if exe:
+        return exe
+    patterns = []
+    for base in (os.environ.get("APPDATA"), os.environ.get("LOCALAPPDATA")):
+        if base:
+            patterns.append(os.path.join(base, "Claude", "claude-code", "*", "claude.exe"))
+    patterns.append(str(Path.home() / ".local" / "bin" / "claude.exe"))
+    patterns.append(str(Path.home() / ".local" / "bin" / "claude"))
+    found = [c for p in patterns for c in glob.glob(p) if os.path.exists(c)]
+    found.sort(key=os.path.getmtime, reverse=True)  # newest version first
+    return found[0] if found else None
+
+
+def start_claude_login():
+    """Launch the official `claude auth login` flow in its own window. It opens
+    the browser, the user signs in to their own account, and it writes the
+    standard credentials file that this app already reads. Returns (ok, error)."""
+    exe = find_claude_binary()
+    if not exe:
+        return False, "no-claude"
+    try:
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x00000010  # CREATE_NEW_CONSOLE
+        subprocess.Popen([exe, "auth", "login"], **kwargs)
+        return True, None
+    except Exception:
+        return False, "spawn-failed"
+
+
+def run_claude_logout():
+    """Sign out via the official `claude auth logout` (clears the local creds).
+    Runs hidden and waits, then refreshes so the bars clear immediately."""
+    exe = find_claude_binary()
+    if not exe:
+        return False, "no-claude"
+    try:
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        subprocess.run([exe, "auth", "logout"], timeout=30,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+    except Exception:
+        return False, "spawn-failed"
+    try:
+        refresh_claude_usage()  # reflect the signed-out state without waiting
+    except Exception:
+        pass
+    return True, None
 
 
 # --------------------------------------------------------------------------
@@ -433,12 +502,11 @@ def _usage_rows(events, now):
     cutoff30 = now - timedelta(days=30)
 
     def bucket(pred):
-        cost, toks = 0.0, 0
+        toks = 0
         for e in events:
             if pred(e["ts"]):
-                cost += e["cost"]
                 toks += e["input"] + e["output"] + e["cache_w"] + e["cache_r"]
-        return {"cost": round(cost, 2), "tokens": toks}
+        return {"tokens": toks}
 
     return {
         "Today": bucket(lambda ts: ts is not None and ts.astimezone().date() == today),
@@ -454,13 +522,16 @@ def build_cards():
     climits, cstatus = get_claude_limits()
 
     cards = [
-        {"name": "Claude Code", "glyph": "claude", "found": CLAUDE_LOG_DIR.exists(),
-         "plan": read_claude_plan(),
-         "limits": climits, "hint": cstatus, "usage": _usage_rows(claude, now)},
+        {"name": "Claude", "glyph": "claude", "found": CLAUDE_LOG_DIR.exists(),
+         "plan": read_claude_plan(), "signed_in": bool(read_claude_token()[0]),
+         "limits": climits, "hint": cstatus, "usage": _usage_rows(claude, now),
+         "limit_note": "all Claude apps · chat, Cowork, Code, CLI",
+         "token_note": "Claude Code on this PC only"},
         {"name": "Codex CLI", "glyph": "codex",
-         "found": any(d.exists() for d in CODEX_LOG_DIRS), "plan": "",
+         "found": any(d.exists() for d in CODEX_LOG_DIRS), "plan": read_codex_plan(),
          "limits": codex_limit_bars(_scan_codex_rate_limits()), "hint": "",
-         "usage": _usage_rows(codex, now)},
+         "usage": _usage_rows(codex, now),
+         "limit_note": "from Codex CLI logs", "token_note": "this PC only"},
     ]
     with _claude_lock:
         fetched = _claude_cache["fetched"]
@@ -480,71 +551,98 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
  :root{--bg:#eceef1;--card:#f5f6f8;--ink:#1f2330;--muted:#8a93a2;
        --reset:#a98b8b;--track:#e2e5ea;--fill:#3b82f6;--line:#e6e8ec}
  *{box-sizing:border-box}
+ html,body{overflow:hidden}                  /* widget: never scrolls */
  body{font-family:'Segoe UI',system-ui,Arial,sans-serif;margin:0;
-      background:var(--bg);color:var(--ink);font-size:14px}
- .wrap{max-width:430px;margin:0 auto;padding:8px 12px 12px}
- .head{display:flex;justify-content:space-between;align-items:center;
-       padding:2px 4px 7px;color:var(--muted);font-size:11px}
- .prov{margin-bottom:9px}
- .ptitle{display:flex;align-items:center;gap:8px;padding:1px 4px 5px}
- .dots{color:#c2c7cf;font-size:15px;letter-spacing:-2px}
- .pname{font-weight:700;font-size:15px}
- .plan{margin-left:8px;background:#e2e8f5;color:#4b5b78;font-size:11px;
-       font-weight:600;padding:2px 8px;border-radius:10px}
- .card{background:var(--card);border-radius:13px;padding:11px 13px}
- .limit{margin-bottom:8px}
- .ltitle{font-weight:600;margin-bottom:3px;font-size:13px}
- .bar{height:6px;background:var(--track);border-radius:6px;overflow:hidden}
- .fill{height:100%;background:var(--fill);border-radius:6px}
- .lmeta{display:flex;justify-content:space-between;margin-top:3px;font-size:12px}
+      background:var(--bg);color:var(--ink);font-size:13px}
+ .wrap{width:100%;margin:0;padding:6px 10px 8px}   /* card fills width, small side gap */
+ .head{display:flex;justify-content:space-between;align-items:baseline;gap:8px;
+       padding:1px 3px 5px;color:var(--muted);font-size:10px}
+ .apptitle{font-weight:700;color:var(--ink);white-space:nowrap}
+ .head .when{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:right}
+ .prov{margin-bottom:7px}
+ .ptitle{display:flex;align-items:center;gap:7px;padding:1px 3px 4px}
+ .dots{color:#c2c7cf;font-size:14px;letter-spacing:-2px}
+ .pname{font-weight:700;font-size:14px}
+ .plan{margin-left:7px;background:#e2e8f5;color:#4b5b78;font-size:10px;
+       font-weight:600;padding:2px 7px;border-radius:9px;white-space:nowrap}
+ .signout{margin-left:auto;background:var(--fill);color:#fff;border:none;
+          font-size:10px;font-weight:600;padding:3px 10px;border-radius:8px;cursor:pointer;
+          user-select:none;white-space:nowrap}
+ .signout:hover{background:#2f6fe0}
+ .card{background:var(--card);border-radius:12px;padding:9px 11px}
+ .cap{font-weight:600;font-size:10px;color:var(--muted);text-transform:uppercase;
+      letter-spacing:.3px;margin:0 0 4px}
+ .cap .sub{font-weight:400;text-transform:none;letter-spacing:0;opacity:.85}
+ .limit{margin-bottom:6px}
+ .ltitle{font-weight:600;margin-bottom:2px;font-size:12px}
+ .bar{height:5px;background:var(--track);border-radius:5px;overflow:hidden}
+ .fill{height:100%;background:var(--fill);border-radius:5px}
+ .lmeta{display:flex;justify-content:space-between;margin-top:2px;font-size:11px}
  .lreset{color:var(--reset)}
- .sep{height:1px;background:var(--line);margin:8px 0}
- .urow{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:13px}
+ .sep{height:1px;background:var(--line);margin:6px 0}
+ .urow{display:flex;justify-content:space-between;align-items:center;padding:2px 0;font-size:12px}
  .ulabel{font-weight:600;display:flex;align-items:center;gap:5px}
- .i{display:inline-block;width:13px;height:13px;border:1px solid #c2c7cf;
-    border-radius:50%;color:#aeb4bd;font-size:9px;line-height:13px;text-align:center}
  .uval{color:var(--muted)}
- .note{color:var(--muted);font-size:12px;padding:3px 0 6px}
- .foot{color:var(--muted);font-size:11px;text-align:center;padding-top:5px}
- .welcome{background:var(--card);border-radius:14px;padding:18px 16px}
- .wtitle{font-weight:700;font-size:16px;margin-bottom:9px}
- .welcome p{margin:0 0 11px;line-height:1.45}
- .welcome ul{margin:0 0 14px;padding-left:18px}
- .welcome li{margin-bottom:7px;line-height:1.4}
+ .note{color:var(--muted);font-size:11px;padding:2px 0 5px}
+ .foot{color:var(--muted);font-size:10px;text-align:center;padding-top:4px}
+ .welcome{background:var(--card);border-radius:13px;padding:16px 14px}
+ .wtitle{font-weight:700;font-size:15px;margin-bottom:8px}
+ .welcome p{margin:0 0 10px;line-height:1.4}
+ .welcome ul{margin:0 0 12px;padding-left:17px}
+ .welcome li{margin-bottom:6px;line-height:1.35}
  .wbtn{display:block;width:100%;background:var(--fill);color:#fff;border:none;
-       border-radius:10px;padding:11px 16px;font-size:15px;font-weight:600;cursor:pointer}
+       border-radius:9px;padding:10px 14px;font-size:14px;font-weight:600;cursor:pointer}
+ .wbtn:disabled{opacity:.75;cursor:default}
+ .cbtn{margin-top:7px;font-size:13px;padding:8px 12px;line-height:1.3}
 </style></head><body>
 <div class="wrap">
- <div class="head"><span>AI Usage Monitor</span>
-   <span>updated <span id="gen">-</span> &middot; next update in <span id="cd">-</span></span></div>
+ <div class="head"><span class="apptitle">AI Usage Monitor</span>
+   <span class="when">updated <span id="gen">-</span> &middot; next update in <span id="cd">-</span></span></div>
  <div id="root"></div>
- <div class="foot">Costs are rough estimates. Claude limits come from your Claude Code login.</div>
+ <div class="foot">Limit bars cover all your Claude usage (chat, Cowork, Code, CLI). Token counts are from this PC's logs only.</div>
 </div>
 <script>
  const ftok=n=>n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n;
- const fcost=c=>c>=1000?'$'+(c/1000).toFixed(1)+'K':'$'+c.toFixed(2);
- const NOTE={'no-login':'Log in to Claude Code to show limits.',
-   'expired':'Claude session expired - open Claude Code to refresh.',
+ const NOTE={'no-login':'Sign in to show your Claude usage limits.',
+   'expired':'Claude session expired - click Connect to refresh it.',
    'rate-limited':'Usage check is rate-limited; it will retry shortly.',
    'network':'Could not reach the usage service.',
    'init':'Loading limits...','ok':'No active usage window right now.'};
+ const LOGINERR={'no-claude':'Claude not found. Install the Claude desktop app, then click Connect again.',
+   'spawn-failed':'Could not start sign-in. Please try again.'};
  function welcomeView(){
    return '<div class="welcome"><div class="wtitle">Welcome to AI Usage Monitor</div>'+
-     '<p>This app shows how much you have used Claude Code and Codex, with rough cost estimates.</p>'+
+     '<p>This app shows how much of your usage limits you have used (as a percentage), plus the tokens used on this computer.</p>'+
      '<ul><li><b>Your data stays on this computer.</b> The only network call is your own usage check to Anthropic, the same one Claude Code makes.</li>'+
-     '<li><b>Codex</b> usage shows up right away.</li>'+
-     '<li><b>Claude</b> limits appear once you have logged in to Claude Code at least once.</li></ul>'+
+     '<li><b>Claude</b> limit bars cover <b>all</b> your Claude usage — chat, Cowork, Claude Code and CLI. Just click <b>Connect Claude</b> the first time to sign in (no terminal needed).</li>'+
+     '<li><b>Token</b> counts come from local logs on this PC only, so Claude chat usage is not included in them.</li></ul>'+
      '<button class="wbtn" onclick="dismiss()">Got it</button></div>';
  }
  async function dismiss(){ try{await fetch("/seen");}catch(e){} load(); }
+ async function connectClaude(btn){
+   btn.disabled=true; btn.textContent='Opening sign-in…';
+   try{
+     const r=await (await fetch('/login')).json();
+     if(r.ok){ btn.textContent='Finish in the window that opened — limits appear here automatically.'; }
+     else{ btn.disabled=false; btn.textContent=(LOGINERR[r.error]||'Could not start sign-in. Try again.'); }
+   }catch(e){ btn.disabled=false; btn.textContent='Could not start sign-in. Try again.'; }
+ }
+ async function logoutClaude(el){
+   el.textContent='Signing out…';
+   try{ await fetch('/logout'); }catch(e){}
+   load();
+ }
  function card(c){
    let h='<div class="prov"><div class="ptitle"><span class="dots">\u2807\u2807</span>'+
      '<span class="pname">'+c.name+'</span>'+
-     (c.plan?('<span class="plan">'+c.plan+'</span>'):'')+'</div><div class="card">';
+     (c.plan?('<span class="plan">'+c.plan+'</span>'):'')+
+     (c.signed_in?('<span class="signout" onclick="logoutClaude(this)">Sign out</span>'):'')+
+     '</div><div class="card">';
    if(!c.found && !(c.hint && c.hint!=='no-login')){
      h+='<div class="note">No logs found yet. Run a session, then this fills in.</div>';
    }
    if(c.limits && c.limits.length){
+     h+='<div class="cap">Usage limit'+(c.limit_note?(' <span class="sub">\u00b7 '+c.limit_note+'</span>'):'')+'</div>';
      for(const l of c.limits){
        h+='<div class="limit"><div class="ltitle">'+l.label+'</div>'+
           '<div class="bar"><div class="fill" style="width:'+l.percent_left+'%"></div></div>'+
@@ -554,11 +652,15 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
      h+='<div class="sep"></div>';
    } else if(c.hint){
      h+='<div class="note">'+(NOTE[c.hint]||'Limits unavailable.')+'</div>';
+     if(c.glyph==='claude' && (c.hint==='no-login'||c.hint==='expired')){
+       h+='<button class="wbtn cbtn" onclick="connectClaude(this)">Connect Claude</button>';
+     }
    }
+   h+='<div class="cap">Tokens used'+(c.token_note?(' <span class="sub">\u00b7 '+c.token_note+'</span>'):'')+'</div>';
    for(const k of ['Today','Yesterday','Last 30 Days']){
      const u=c.usage[k];if(!u)continue;
-     const val=(u.tokens>0)?(fcost(u.cost)+' \u00b7 '+ftok(u.tokens)+' tokens'):'\u2014';
-     h+='<div class="urow"><span class="ulabel">'+k+' <span class="i">i</span></span>'+
+     const val=(u.tokens>0)?(ftok(u.tokens)+' tokens'):'\u2014';
+     h+='<div class="urow"><span class="ulabel">'+k+'</span>'+
         '<span class="uval">'+val+'</span></div>';
    }
    h+='</div></div>';
@@ -570,16 +672,43 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
    return m>0?(m+'m '+ss+'s'):(ss+'s'); }
  function tickCd(){ if(nextSecs!=null){ nextSecs=Math.max(0,nextSecs-1);
    document.getElementById('cd').textContent=fmtCd(nextSecs); } }
+ // Widget sizing: set the window to ~half the screen height ONCE, then scale the
+ // content (CSS zoom) so it always fits that fixed height — never scrolls.
+ let sized=false;
+ function scaleToFit(){
+   try{
+     document.body.style.zoom='1';
+     const avail=window.innerHeight;
+     const content=document.documentElement.scrollHeight;
+     let z = (content>avail) ? (avail/content) : 1;
+     z = Math.max(0.5, Math.min(1, z*0.99));   // small margin; don't shrink to unreadable
+     document.body.style.zoom = (z>=0.999 ? '' : z);
+   }catch(e){}
+ }
+ function fitWidget(){
+   try{
+     const api=window.pywebview&&window.pywebview.api;
+     if(api&&api.set_height&&!sized){
+       sized=true;
+       api.set_height(Math.round(screen.availHeight*__FRACTION__));
+       setTimeout(scaleToFit,170);            // let the native resize settle
+       return;
+     }
+     scaleToFit();
+   }catch(e){ scaleToFit(); }
+ }
  async function load(){
    try{
      const d=await (await fetch('/data')).json();
      document.getElementById('gen').textContent=d.generated;
      if(typeof d.claude_next==='number'){nextSecs=d.claude_next;
        document.getElementById('cd').textContent=fmtCd(nextSecs);}
-     if(d.first_run){document.getElementById('root').innerHTML=welcomeView();return;}
-     document.getElementById('root').innerHTML=d.cards.map(card).join('');
+     if(d.first_run){document.getElementById('root').innerHTML=welcomeView();}
+     else{document.getElementById('root').innerHTML=d.cards.map(card).join('');}
+     setTimeout(fitWidget,60);
    }catch(e){}
  }
+ window.addEventListener('pywebviewready',function(){setTimeout(fitWidget,60);});
  load();setInterval(load,__REFRESH__000);setInterval(tickCd,1000);
 </script></body></html>"""
 
@@ -592,11 +721,20 @@ class Handler(BaseHTTPRequestHandler):
         if self.path.startswith("/seen"):
             set_welcomed()
             body, ctype = b'{"ok":true}', "application/json"
+        elif self.path.startswith("/login"):
+            ok, err = start_claude_login()
+            body = json.dumps({"ok": ok, "error": err}).encode("utf-8")
+            ctype = "application/json"
+        elif self.path.startswith("/logout"):
+            ok, err = run_claude_logout()
+            body = json.dumps({"ok": ok, "error": err}).encode("utf-8")
+            ctype = "application/json"
         elif self.path.startswith("/data"):
             body = json.dumps(build_cards()).encode("utf-8")
             ctype = "application/json"
         else:
-            body = PAGE.replace("__REFRESH__", str(REFRESH_SECONDS)).encode("utf-8")
+            body = (PAGE.replace("__REFRESH__", str(REFRESH_SECONDS))
+                        .replace("__FRACTION__", str(WINDOW_FRACTION))).encode("utf-8")
             ctype = "text/html; charset=utf-8"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
@@ -652,6 +790,35 @@ def run_claude_test():
         pass
 
 
+def primary_screen_height():
+    """Primary screen height in logical pixels (~CSS px). 0 if it can't be read."""
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.GetSystemMetrics(1))  # SM_CYSCREEN
+    except Exception:
+        return 0
+
+
+class WinApi:
+    """Exposed to the page so it can set the widget to ~half the screen height.
+    The window is non-resizable; the page scales its own content to fit."""
+
+    def __init__(self):
+        self._window = None
+
+    def bind(self, window):
+        self._window = window
+
+    def set_height(self, height):
+        try:
+            h = max(WINDOW_MIN_HEIGHT, min(int(round(float(height))), WINDOW_MAX_HEIGHT))
+            if self._window is not None:
+                self._window.resize(WINDOW_WIDTH, h)
+        except Exception:
+            pass
+        return True
+
+
 def main():
     if "--test-claude" in sys.argv:
         run_claude_test()
@@ -670,9 +837,15 @@ def main():
         webview = None
     if webview is not None:
         try:
-            webview.create_window("AI Usage Monitor", url,
-                                  width=WINDOW_WIDTH, height=WINDOW_HEIGHT,
-                                  min_size=(360, 420), on_top=ALWAYS_ON_TOP)
+            sh = primary_screen_height()
+            init_h = (max(WINDOW_MIN_HEIGHT, min(int(sh * WINDOW_FRACTION), WINDOW_MAX_HEIGHT))
+                      if sh else WINDOW_HEIGHT)
+            api = WinApi()
+            window = webview.create_window("AI Usage Monitor", url,
+                                           width=WINDOW_WIDTH, height=init_h,
+                                           resizable=False, on_top=ALWAYS_ON_TOP,
+                                           js_api=api)
+            api.bind(window)
             webview.start()
             return
         except Exception:
