@@ -981,11 +981,13 @@ PAGE_MINI = r"""<!doctype html><html><head><meta charset="utf-8">
  .urow{display:flex;justify-content:space-between;font-size:11px;padding:1px 0}
  .uval{color:var(--muted)}
  .note{color:var(--muted);font-size:10px;padding:2px 0}
- /* compact bar - sits on the taskbar (height set to the collapsed window in JS) */
- #compact{position:absolute;left:0;right:0;bottom:0;height:__BARH__px;
+ /* compact bar - fills the whole window at rest (so it stays visible whatever
+    height Windows actually gives us); shrinks to the bottom strip when open */
+ #compact{position:absolute;left:0;right:0;top:0;bottom:0;
    background:rgba(30,32,37,.94);color:#fff;border-radius:6px;
    padding:2px 8px;display:flex;flex-direction:column;justify-content:center;gap:2px;
    cursor:move;box-shadow:0 1px 6px rgba(0,0,0,.35)}
+ body.open #compact{top:auto;height:__BARH__px}
  #compact.locked{cursor:default}
  .mrow{display:flex;align-items:center;gap:6px;font-size:10px;font-weight:600;line-height:1.15}
  .mname{width:42px;color:#aeb6c2}
@@ -1221,6 +1223,8 @@ if os.name == "nt":
         _WIN.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
         _WIN.GetCursorPos.restype = wintypes.BOOL
         _WIN.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        _WIN.ShowWindow.restype = wintypes.BOOL
+        _WIN.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
         try:
             _WIN.GetDpiForWindow.restype = wintypes.UINT
             _WIN.GetDpiForWindow.argtypes = [wintypes.HWND]
@@ -1229,11 +1233,77 @@ if os.name == "nt":
     except Exception:
         _WIN = None
 
+# ---- single instance (Windows): a second launch must not start a duplicate
+# app/tray icon — it pokes the running instance to show its window, then exits.
+_K32 = None
+_single_mutex = None      # held (never closed) for the whole process lifetime
+_show_event = None
+if os.name == "nt":
+    try:
+        import ctypes
+        _K32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _K32.CreateMutexW.restype = ctypes.c_void_p
+        _K32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        _K32.CreateEventW.restype = ctypes.c_void_p
+        _K32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                                      ctypes.c_wchar_p]
+        _K32.OpenEventW.restype = ctypes.c_void_p
+        _K32.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+        _K32.SetEvent.restype = ctypes.c_int
+        _K32.SetEvent.argtypes = [ctypes.c_void_p]
+        _K32.WaitForSingleObject.restype = ctypes.c_uint32
+        _K32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        _K32.CloseHandle.restype = ctypes.c_int
+        _K32.CloseHandle.argtypes = [ctypes.c_void_p]
+    except Exception:
+        _K32 = None
+
+_MUTEX_NAME = "Local\\AIUsageMonitor_SingleInstance"
+_SHOW_EVENT_NAME = "Local\\AIUsageMonitor_ShowMain"
+_ERROR_ALREADY_EXISTS = 183
+_EVENT_MODIFY_STATE = 0x0002
+
+
+def other_instance_running():
+    """First launch claims a named mutex and creates the show-event, returning
+    False. A later launch finds the mutex taken, signals the running instance
+    to show its main window, and returns True (caller should just exit)."""
+    global _single_mutex, _show_event
+    if not _K32:
+        return False
+    _single_mutex = _K32.CreateMutexW(None, 0, _MUTEX_NAME)
+    if ctypes.get_last_error() == _ERROR_ALREADY_EXISTS:
+        ev = _K32.OpenEventW(_EVENT_MODIFY_STATE, 0, _SHOW_EVENT_NAME)
+        if ev:
+            _K32.SetEvent(ev)
+            _K32.CloseHandle(ev)
+        return True
+    _show_event = _K32.CreateEventW(None, 0, 0, _SHOW_EVENT_NAME)  # auto-reset
+    return False
+
+
+def show_request_watcher(window):
+    """Daemon thread in the running instance: each time a second launch signals
+    the show-event, bring the main window back (same as tray -> Open)."""
+    while _K32 and _show_event:
+        _K32.WaitForSingleObject(_show_event, 0xFFFFFFFF)
+        if _quitting:
+            return
+        try:
+            window.show()
+            window.restore()
+        except Exception:
+            pass
+
+
 _HWND_TOPMOST = -1
 _SWP_NOACTIVATE, _SWP_SHOWWINDOW = 0x0010, 0x0040
 _SWP_FRAMECHANGED, _SWP_NOMOVE, _SWP_NOSIZE, _SWP_NOZORDER = 0x0020, 0x0002, 0x0001, 0x0004
 _GWL_STYLE, _GWL_EXSTYLE = -16, -20
 _WS_EX_TOOLWINDOW, _WS_EX_TOPMOST = 0x00000080, 0x00000008
+# WinForms sets WS_EX_APPWINDOW (ShowInTaskbar default) — it FORCES a taskbar
+# button and beats WS_EX_TOOLWINDOW, so it must be cleared, not just outvoted.
+_WS_EX_APPWINDOW = 0x00040000
 # frame bits to strip so the widget is truly borderless (pywebview frameless can
 # be ignored by the WebView2 backend, leaving a title bar + a minimum size)
 _WS_CAPTION, _WS_THICKFRAME = 0x00C00000, 0x00040000
@@ -1292,36 +1362,44 @@ def _place(hwnd, x, y, w, h):
 
 
 def _style_widget(hwnd):
-    """Force the mini window borderless + no taskbar button (Win32), since the
-    WebView2 backend may ignore pywebview's frameless flag."""
+    """Force the mini window borderless + no taskbar button/thumbnail (Win32),
+    since the WebView2 backend may ignore pywebview's frameless flag and always
+    sets WS_EX_APPWINDOW. Called every dock tick: it no-ops when the styles are
+    already right, so WinForms can't quietly re-apply its own."""
     if not (_WIN and hwnd):
         return
     st = _GETL(hwnd, _GWL_STYLE)
-    st &= ~(_WS_CAPTION | _WS_THICKFRAME | _WS_MINIMIZEBOX | _WS_MAXIMIZEBOX | _WS_SYSMENU)
-    _SETL(hwnd, _GWL_STYLE, st)
+    want_st = st & ~(_WS_CAPTION | _WS_THICKFRAME | _WS_MINIMIZEBOX
+                     | _WS_MAXIMIZEBOX | _WS_SYSMENU)
     ex = _GETL(hwnd, _GWL_EXSTYLE)
-    _SETL(hwnd, _GWL_EXSTYLE, ex | _WS_EX_TOOLWINDOW | _WS_EX_TOPMOST)
+    want_ex = (ex | _WS_EX_TOOLWINDOW | _WS_EX_TOPMOST) & ~_WS_EX_APPWINDOW
+    if st == want_st and ex == want_ex:
+        return
+    _SETL(hwnd, _GWL_STYLE, want_st)
+    # The taskbar only re-reads the TOOLWINDOW/APPWINDOW flags on a
+    # hidden->visible transition, so the style change must be wrapped in a
+    # hide/show or the widget keeps its taskbar button/thumbnail.
+    _WIN.ShowWindow(hwnd, 0)              # SW_HIDE
+    _SETL(hwnd, _GWL_EXSTYLE, want_ex)
     try:
         _WIN.SetWindowTextW(hwnd, "")     # drop the pointless "AI Usage (mini)" title
     except Exception:
         pass
     _WIN.SetWindowPos(hwnd, _HWND_TOPMOST, 0, 0, 0, 0,
                       _SWP_FRAMECHANGED | _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE)
+    _WIN.ShowWindow(hwnd, 4)              # SW_SHOWNOACTIVATE
 
 
 def taskbar_dock_loop(mini):
     """Keep the gadget styled + docked, and drive hover expand/collapse from the
     real cursor position (JS mouseenter/leave is unreliable for a topmost,
     frameless window). Python is the single source of truth for the geometry."""
-    styled = False
     while True:
         try:
             if mini and mini.visible:
                 hwnd = mini.hwnd()
                 if hwnd:
-                    if not styled:
-                        _style_widget(hwnd)
-                        styled = True
+                    _style_widget(hwnd)   # no-op unless the styles drifted
                     mini.tick(hwnd)
         except Exception:
             pass
@@ -1535,6 +1613,9 @@ def main():
         run_claude_test()
         return
 
+    if other_instance_running():
+        return    # the running instance was told to show its window instead
+
     threading.Thread(target=claude_usage_loop, daemon=True).start()
     threading.Thread(target=codex_usage_loop, daemon=True).start()
 
@@ -1570,10 +1651,16 @@ def main():
                                                 x=120, y=120, frameless=True,
                                                 on_top=True, resizable=False,
                                                 easy_drag=False, focus=False,
+                                                # pywebview's default min_size (200x100 logical) is
+                                                # enforced by Windows even against raw SetWindowPos,
+                                                # so the compact bar could never reach its real size
+                                                min_size=(1, 1),
                                                 background_color="#1e2025",
                                                 hidden=(not ms["enabled"]), js_api=mini)
             mini.bind(mini_window, ms["enabled"], ms["x"])
             threading.Thread(target=taskbar_dock_loop, args=(mini,), daemon=True).start()
+            threading.Thread(target=show_request_watcher, args=(window,),
+                             daemon=True).start()
 
             # X on the main window minimizes to the tray. But if the tray failed
             # to start, closing must FULLY quit (destroy the hidden mini too) so
