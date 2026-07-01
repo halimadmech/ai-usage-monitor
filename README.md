@@ -1,5 +1,9 @@
 # AI Usage Monitor (Claude + Codex)
 
+<p align="center">
+  <img src="assets/social-preview.png" alt="AI Usage Monitor — Claude + Codex usage at a glance" width="820">
+</p>
+
 A tiny desktop **widget** for Windows that shows, at a glance, how much of your
 **Claude** and **Codex (ChatGPT)** usage you have left — as easy-to-read bars —
 plus how many tokens you have used today, yesterday, and over the last 30 days.
