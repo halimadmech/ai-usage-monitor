@@ -65,6 +65,10 @@ CLAUDE_CREDS = Path.home() / ".claude" / ".credentials.json"
 CLAUDE_LOG_DIR = Path.home() / ".claude" / "projects"
 CODEX_LOG_DIRS = [Path.home() / ".codex" / "sessions", Path.home() / ".codex"]
 CODEX_AUTH = Path.home() / ".codex" / "auth.json"
+# Codex limits can be read LIVE (no model call, no quota) by driving the official
+# `codex app-server`'s `account/rateLimits/read` RPC. Polled gently; falls back to
+# the last log snapshot if the codex binary isn't installed.
+CODEX_POLL_SECONDS = 120
 STATE_FILE = Path.home() / ".usage_monitor_state.json"  # welcome marker only
 
 
@@ -110,6 +114,24 @@ def fmt_reset(seconds):
     if h > 0:
         return f"{h}h {m}m" if m else f"{h}h"
     return f"{m}m"
+
+
+def fmt_ago(seconds):
+    """'as of' phrasing for a past timestamp, e.g. '5m ago', '3d ago'."""
+    if seconds is None:
+        return None
+    try:
+        s = max(0, int(seconds))
+    except Exception:
+        return None
+    if s < 60:
+        return "just now"
+    d, h, m = s // 86400, (s % 86400) // 3600, (s % 3600) // 60
+    if d > 0:
+        return f"{d}d ago"
+    if h > 0:
+        return f"{h}h ago"
+    return f"{m}m ago"
 
 
 # --------------------------------------------------------------------------
@@ -164,6 +186,23 @@ def _codex_info(row):
     if isinstance(p, dict):
         return p
     return row
+
+
+def _codex_rate_limits(row):
+    """Find a `rate_limits` block regardless of Codex CLI log schema version.
+
+    Older logs nested it inside `info` (so `_codex_info()` happened to surface
+    it); current logs put it as a sibling of `info` under `payload`, which
+    `_codex_info()` no longer reaches. Check every plausible spot directly
+    rather than relying on `_codex_info()`'s single guess.
+    """
+    if not isinstance(row, dict):
+        return None
+    for holder in (row, row.get("info"), row.get("payload"),
+                   (row.get("payload") or {}).get("info") if isinstance(row.get("payload"), dict) else None):
+        if isinstance(holder, dict) and isinstance(holder.get("rate_limits"), dict):
+            return holder["rate_limits"]
+    return None
 
 
 def parse_codex():
@@ -236,8 +275,7 @@ def _scan_codex_rate_limits():
                         row = json.loads(line)
                     except Exception:
                         continue
-                    info = _codex_info(row)
-                    rl = info.get("rate_limits") if isinstance(info, dict) else None
+                    rl = _codex_rate_limits(row)
                     if not isinstance(rl, dict):
                         continue
                     ts = parse_ts(row.get("timestamp") or row.get("ts"))
@@ -245,13 +283,18 @@ def _scan_codex_rate_limits():
                         latest, latest_ts = rl, ts
         except Exception:
             continue
-    return latest
+    return latest, latest_ts
 
 
 def codex_limit_bars(rl):
+    """Codex's own logs give an absolute `resets_at` (unix epoch), not a
+    countdown, so it's converted to seconds-from-now here. If that moment has
+    already passed, the local snapshot is too old to say anything useful about
+    the reset, so leave it blank rather than show a misleading "0m"."""
     if not isinstance(rl, dict):
         return []
     out = []
+    now = time.time()
     for key in ("primary", "secondary"):
         b = rl.get(key)
         if not isinstance(b, dict):
@@ -261,9 +304,15 @@ def codex_limit_bars(rl):
             continue
         win = b.get("window_minutes") or 0
         label = "Session" if (win and win <= 600) else ("Weekly" if win else key.title())
+        secs = b.get("resets_in_seconds")
+        if secs is None and b.get("resets_at") is not None:
+            try:
+                secs = float(b["resets_at"]) - now
+            except Exception:
+                secs = None
         out.append({"label": label,
                     "percent_left": max(0, min(100, round(100 - float(used)))),
-                    "resets": fmt_reset(b.get("resets_in_seconds"))})
+                    "resets": fmt_reset(secs) if (secs is not None and secs >= 0) else None})
     return out
 
 
@@ -280,10 +329,105 @@ def read_codex_plan():
         plan = (auth.get("chatgpt_plan_type") or "").lower()
     except Exception:
         return None
-    label = {"plus": "Plus", "pro": "Pro", "team": "Team", "business": "Business",
-             "enterprise": "Enterprise", "edu": "Edu", "free": "Free"}.get(
-        plan, plan.title() if plan else "")
+    label = _CODEX_PLAN_LABELS.get(plan, plan.title() if plan else "")
     return ("ChatGPT " + label) if label else None
+
+
+_CODEX_PLAN_LABELS = {"plus": "Plus", "pro": "Pro", "team": "Team",
+                      "business": "Business", "enterprise": "Enterprise",
+                      "edu": "Edu", "free": "Free", "go": "Go"}
+
+
+def find_codex_binary():
+    """Locate the official `codex` executable (needed for the live limits read)."""
+    exe = shutil.which("codex")
+    if exe:
+        return exe
+    patterns = []
+    for base in (os.environ.get("LOCALAPPDATA"), os.environ.get("APPDATA")):
+        if base:
+            patterns.append(os.path.join(base, "OpenAI", "Codex", "bin", "codex.exe"))
+    patterns.append(str(Path.home() / ".codex" / "bin" / "codex.exe"))
+    for p in patterns:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def fetch_codex_usage(timeout=25):
+    """Read LIVE Codex rate limits via the official `codex app-server` RPC
+    `account/rateLimits/read` — the same call the Codex desktop app makes. This
+    is an account read, not a model turn, so it costs no quota. Returns
+    (snapshot_in_scan_format, plan_label, error)."""
+    exe = find_codex_binary()
+    if not exe:
+        return None, None, "no-codex"
+    kwargs = {}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+    try:
+        proc = subprocess.Popen(
+            [exe, "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, **kwargs)
+    except Exception:
+        return None, None, "spawn-failed"
+
+    result = {"box": None}
+    def drive():
+        try:
+            def send(obj):
+                proc.stdin.write(json.dumps(obj) + "\n")
+                proc.stdin.flush()
+            send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                  "params": {"clientInfo": {"name": "ai-usage-monitor",
+                                            "title": None, "version": "1.0"},
+                             "capabilities": None}})
+            asked = False
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue
+                if msg.get("id") == 1 and "result" in msg and not asked:
+                    asked = True
+                    send({"jsonrpc": "2.0", "id": 2,
+                          "method": "account/rateLimits/read"})
+                elif msg.get("id") == 2:
+                    result["box"] = msg
+                    return
+        except Exception:
+            pass
+
+    t = threading.Thread(target=drive, daemon=True)
+    t.start()
+    t.join(timeout)
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+
+    msg = result["box"]
+    if not msg or "result" not in msg:
+        return None, None, "no-response"
+    rl = (msg["result"] or {}).get("rateLimits") or {}
+
+    def win(w):
+        if not isinstance(w, dict):
+            return None
+        return {"used_percent": w.get("usedPercent"),
+                "window_minutes": w.get("windowDurationMins"),
+                "resets_at": w.get("resetsAt")}
+
+    snap = {"primary": win(rl.get("primary")), "secondary": win(rl.get("secondary"))}
+    plan = rl.get("planType")
+    plan_label = None
+    if plan:
+        lbl = _CODEX_PLAN_LABELS.get(str(plan).lower(), str(plan).title())
+        plan_label = "ChatGPT " + lbl
+    return snap, plan_label, None
 
 
 # --------------------------------------------------------------------------
@@ -493,6 +637,71 @@ def set_welcomed():
 
 
 # --------------------------------------------------------------------------
+# Codex limits: live via app-server, with a local-log-snapshot fallback
+# --------------------------------------------------------------------------
+
+_codex_cache = {"bars": [], "plan": None, "note": "from Codex CLI logs",
+                "hint": "", "fetched": 0.0}
+_codex_lock = threading.Lock()
+
+
+def _codex_from_logs():
+    """Fallback view built from the last rate_limits snapshot in the local logs."""
+    rl, ts = _scan_codex_rate_limits()
+    bars = codex_limit_bars(rl)
+    if bars and ts:
+        age = fmt_ago((datetime.now(timezone.utc) - ts).total_seconds())
+        return bars, f"as of last Codex run · {age}", ""
+    if bars:
+        return bars, "from Codex CLI logs", ""
+    return [], "from Codex CLI logs", "no-data"
+
+
+def refresh_codex_usage(prefer_live=True):
+    bars = note = hint = plan = None
+    if prefer_live:
+        snap, plan_label, err = fetch_codex_usage()
+        if err is None and snap:
+            bars = codex_limit_bars(snap)
+            if bars:
+                note, hint, plan = "live · updated just now", "", plan_label
+    if bars is None:                       # no binary / failed → local logs
+        bars, note, hint = _codex_from_logs()
+    if plan is None:
+        plan = read_codex_plan()
+    with _codex_lock:
+        _codex_cache.update(bars=bars, note=note, hint=hint, plan=plan,
+                            fetched=time.time())
+
+
+def codex_usage_loop():
+    # seed instantly from local logs so the card isn't empty while the first
+    # (slower) live read spins up, then poll live limits gently.
+    try:
+        refresh_codex_usage(prefer_live=False)
+    except Exception:
+        pass
+    while True:
+        try:
+            refresh_codex_usage(prefer_live=True)
+        except Exception:
+            pass
+        time.sleep(CODEX_POLL_SECONDS)
+
+
+def get_codex_view():
+    """(bars, note, hint, plan) for the Codex card. Uses the background cache
+    once populated; otherwise computes a quick local-log view synchronously so
+    direct callers (tests, first paint) still work without spawning anything."""
+    with _codex_lock:
+        if _codex_cache["fetched"]:
+            c = dict(_codex_cache)
+            return c["bars"], c["note"], c["hint"], c["plan"]
+    bars, note, hint = _codex_from_logs()
+    return bars, note, hint, read_codex_plan()
+
+
+# --------------------------------------------------------------------------
 # build cards
 # --------------------------------------------------------------------------
 
@@ -521,6 +730,11 @@ def build_cards():
     codex = parse_codex()
     climits, cstatus = get_claude_limits()
 
+    # Codex bars are read LIVE via the app-server when available (see
+    # get_codex_view / codex_usage_loop), falling back to the last local-log
+    # snapshot (labelled with its age) when the codex binary isn't installed.
+    codex_bars, codex_note, codex_hint, codex_plan = get_codex_view()
+
     cards = [
         {"name": "Claude", "glyph": "claude", "found": CLAUDE_LOG_DIR.exists(),
          "plan": read_claude_plan(), "signed_in": bool(read_claude_token()[0]),
@@ -528,10 +742,10 @@ def build_cards():
          "limit_note": "all Claude apps · chat, Cowork, Code, CLI",
          "token_note": "Claude Code on this PC only"},
         {"name": "Codex CLI", "glyph": "codex",
-         "found": any(d.exists() for d in CODEX_LOG_DIRS), "plan": read_codex_plan(),
-         "limits": codex_limit_bars(_scan_codex_rate_limits()), "hint": "",
+         "found": any(d.exists() for d in CODEX_LOG_DIRS), "plan": codex_plan,
+         "limits": codex_bars, "hint": codex_hint,
          "usage": _usage_rows(codex, now),
-         "limit_note": "from Codex CLI logs", "token_note": "this PC only"},
+         "limit_note": codex_note, "token_note": "this PC only"},
     ]
     with _claude_lock:
         fetched = _claude_cache["fetched"]
@@ -607,7 +821,8 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
    'expired':'Claude session expired - click Connect to refresh it.',
    'rate-limited':'Usage check is rate-limited; it will retry shortly.',
    'network':'Could not reach the usage service.',
-   'init':'Loading limits...','ok':'No active usage window right now.'};
+   'init':'Loading limits...','ok':'No active usage window right now.',
+   'no-data':'No usage snapshot yet - run a Codex session, then this fills in.'};
  const LOGINERR={'no-claude':'Claude not found. Install the Claude desktop app, then click Connect again.',
    'spawn-failed':'Could not start sign-in. Please try again.'};
  function welcomeView(){
@@ -825,6 +1040,7 @@ def main():
         return
 
     threading.Thread(target=claude_usage_loop, daemon=True).start()
+    threading.Thread(target=codex_usage_loop, daemon=True).start()
 
     port = find_port(PREFERRED_PORT)
     url = f"http://localhost:{port}"

@@ -112,8 +112,12 @@ You only need this if you want to change the code or build the `.exe` from sourc
   (about every 5 minutes). Because it’s tied to your subscription, it counts all
   Claude surfaces (chat, Cowork, Code, CLI).
 - **Claude tokens:** Claude Code’s local session logs on this PC.
-- **Codex bars + tokens:** the Codex CLI’s local logs. The plan badge is read from
-  the `chatgpt_plan_type` field of the local Codex login file (no network call).
+- **Codex bars:** read **live** from the official `codex app-server`’s
+  `account/rateLimits/read` (the same account read the Codex desktop app uses — an
+  account-status call, not a model request, so it costs no quota). If the Codex CLI
+  isn’t installed, it falls back to the last snapshot in the local logs, labelled
+  with its age. The plan badge comes from the live read (or the local login file).
+- **Codex tokens:** the Codex CLI’s local logs on this PC.
 
 ### Troubleshooting the Claude bars
 
