@@ -11,5 +11,5 @@ if not defined PY (
   pause
   exit /b 1
 )
-%PY% -m pip install --quiet pywebview >nul 2>nul
+%PY% -m pip install --quiet pywebview pystray pillow >nul 2>nul
 %PY% usage_monitor.py

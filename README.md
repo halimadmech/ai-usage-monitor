@@ -59,6 +59,19 @@ That’s it. Leave the window open whenever you want to keep an eye on your usag
 So if a token row shows “—” but the bars have moved, that’s normal — it just means
 that usage happened in the Claude chat app, which the bars already count.
 
+## Runs like a normal app (tray + mini widget)
+
+- **System tray icon.** Closing the window (the **✕**) doesn’t quit — it tucks the
+  app into your system tray (bottom-right, by the clock). **Right-click the tray icon**
+  for **Open**, **Mini widget**, and **Exit**. Only **Exit** closes it completely.
+- **Taskbar widget.** A tiny bar that sits **on your taskbar** showing just your
+  **Claude %** and **Codex %** on two lines (on by default; toggle from the tray).
+  **Hover** it to pop open the full view; move the mouse away and it shrinks back.
+  **Drag** it to the exact empty spot you like on the taskbar, then click the small
+  **LOCKED/UNLOCKED** label to pin it. It remembers where you put it.
+  > Windows 11 removed the old "in the taskbar" widget API, so this rides *on top of*
+  > the taskbar (always visible, styled to blend in) rather than being embedded in it.
+
 ## Signing in and out
 
 - **Connect Claude** runs the official Claude sign-in for you. It uses the Claude

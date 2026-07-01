@@ -28,7 +28,7 @@ echo  Using Python: %PY%
 echo.
 
 echo  Step 1 of 2: installing the build tools...
-%PY% -m pip install --quiet --upgrade pip pyinstaller pywebview
+%PY% -m pip install --quiet --upgrade pip pyinstaller pywebview pystray pillow
 if errorlevel 1 (
   echo  [ERROR] Could not install the build tools. Check your internet connection.
   pause
@@ -38,7 +38,8 @@ echo  Done.
 echo.
 
 echo  Step 2 of 2: compiling the executable...
-%PY% -m PyInstaller --onefile --windowed --name AIUsage --icon app.ico usage_monitor.py
+%PY% -m PyInstaller --onefile --windowed --name AIUsage --icon app.ico ^
+  --add-data "app.ico;." --hidden-import pystray._win32 usage_monitor.py
 if errorlevel 1 (
   echo  [ERROR] The build failed. See the messages above.
   pause

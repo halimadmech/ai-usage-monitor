@@ -53,6 +53,15 @@ WINDOW_MIN_HEIGHT = 300
 WINDOW_MAX_HEIGHT = 2000
 ALWAYS_ON_TOP = False         # True pins the window above others, widget-style
 
+# Taskbar mini gadget (always-on-top; a 2-line bar that expands on hover).
+# MINI_BAR_HEIGHT is a fixed CSS height that comfortably fits the two lines; the
+# window is sized to it (× DPI scale) and centered on the taskbar, so the layout
+# never depends on measuring the taskbar height at runtime.
+MINI_WIDTH = 184
+MINI_BAR_HEIGHT = 40
+MINI_EXPANDED_WIDTH = 380
+MINI_EXPANDED_HEIGHT = 520
+
 # Claude usage endpoint (the same one Claude Code uses). The User-Agent header
 # is REQUIRED; without it the endpoint hard rate-limits. Poll no faster than
 # ~180s. Edit CLAUDE_UA if a future Claude Code version rejects this one.
@@ -616,24 +625,35 @@ def run_claude_logout():
 # welcome marker
 # --------------------------------------------------------------------------
 
-def is_welcomed():
+def read_state():
     try:
-        return bool(json.loads(STATE_FILE.read_text(encoding="utf-8")).get("welcomed"))
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except Exception:
-        return False
+        return {}
 
 
-def set_welcomed():
-    state = {}
-    try:
-        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        state = {}
-    state["welcomed"] = True
+def write_state(**changes):
+    state = read_state()
+    state.update(changes)
     try:
         STATE_FILE.write_text(json.dumps(state), encoding="utf-8")
     except Exception:
         pass
+
+
+def is_welcomed():
+    return bool(read_state().get("welcomed"))
+
+
+def set_welcomed():
+    write_state(welcomed=True)
+
+
+def get_mini_settings():
+    s = read_state()
+    return {"enabled": bool(s.get("mini_enabled", True)),   # taskbar widget on by default
+            "locked": bool(s.get("mini_locked", False)),
+            "x": s.get("mini_x"), "y": s.get("mini_y")}
 
 
 # --------------------------------------------------------------------------
@@ -928,6 +948,144 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 </script></body></html>"""
 
 
+# Compact always-on-top gadget: two lines (Claude% / Codex% session) that expand
+# to the full view on hover, with drag + lock. Talks to a MiniController js_api.
+PAGE_MINI = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>mini</title>
+<style>
+ :root{--bg:#eceef1;--card:#f5f6f8;--ink:#1f2330;--muted:#8a93a2;
+       --reset:#a98b8b;--track:#d7dbe2;--fill:#3b82f6;--line:#e6e8ec}
+ *{box-sizing:border-box}
+ html,body{margin:0;height:100vh;overflow:hidden;background:transparent;
+   font-family:'Segoe UI',system-ui,Arial,sans-serif;user-select:none}
+ body{position:relative}
+ /* full flyout panel - opens ABOVE the bar on hover (bottom set to bar height in JS) */
+ #full{position:absolute;left:0;right:0;top:0;bottom:__BARH__px;overflow:auto;display:none;
+   background:var(--bg);color:var(--ink);border-radius:10px 10px 0 0;padding:8px 10px;
+   box-shadow:0 -2px 14px rgba(0,0,0,.28)}
+ body.open #full{display:block}
+ .cap{font-weight:600;font-size:10px;color:var(--muted);text-transform:uppercase;
+   letter-spacing:.3px;margin:0 0 4px}
+ .prov{margin-bottom:8px}
+ .ptitle{display:flex;align-items:center;gap:6px;padding:2px 2px 5px}
+ .pname{font-weight:700;font-size:13px;color:var(--ink)}
+ .plan{background:#e2e8f5;color:#4b5b78;font-size:9px;font-weight:600;padding:1px 6px;border-radius:8px}
+ .card{background:var(--card);border-radius:10px;padding:8px 10px}
+ .limit{margin-bottom:6px}
+ .ltitle{font-weight:600;font-size:11px;margin-bottom:2px}
+ .bar{height:5px;background:var(--track);border-radius:5px;overflow:hidden}
+ .fill{height:100%;background:var(--fill)}
+ .lmeta{display:flex;justify-content:space-between;margin-top:2px;font-size:10px}
+ .lreset{color:var(--reset)}
+ .sep{height:1px;background:var(--line);margin:6px 0}
+ .urow{display:flex;justify-content:space-between;font-size:11px;padding:1px 0}
+ .uval{color:var(--muted)}
+ .note{color:var(--muted);font-size:10px;padding:2px 0}
+ /* compact bar - sits on the taskbar (height set to the collapsed window in JS) */
+ #compact{position:absolute;left:0;right:0;bottom:0;height:__BARH__px;
+   background:rgba(30,32,37,.94);color:#fff;border-radius:6px;
+   padding:2px 8px;display:flex;flex-direction:column;justify-content:center;gap:2px;
+   cursor:move;box-shadow:0 1px 6px rgba(0,0,0,.35)}
+ #compact.locked{cursor:default}
+ .mrow{display:flex;align-items:center;gap:6px;font-size:10px;font-weight:600;line-height:1.15}
+ .mname{width:42px;color:#aeb6c2}
+ .mbar{flex:1;height:4px;background:rgba(255,255,255,.16);border-radius:4px;overflow:hidden}
+ .mfill{height:100%;background:#4c8dff}
+ .mpct{width:30px;text-align:right;color:#fff}
+</style></head><body>
+ <div id="full"></div>
+ <div id="compact">
+   <div class="mrow"><span class="mname">Claude</span>
+     <span class="mbar"><span class="mfill" id="cf" style="width:0%"></span></span>
+     <span class="mpct" id="cp">--</span></div>
+   <div class="mrow"><span class="mname">Codex</span>
+     <span class="mbar"><span class="mfill" id="xf" style="width:0%"></span></span>
+     <span class="mpct" id="xp">--</span></div>
+ </div>
+<script>
+ const ftok=n=>n>=1e9?(n/1e9).toFixed(1)+'B':n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':''+n;
+ const NOTE={'no-login':'Sign in (open the main window).','expired':'Session expired.',
+   'rate-limited':'Rate-limited; retrying.','network':'No connection.','init':'Loading...',
+   'ok':'No active window.','no-data':'Run a session to fill this in.'};
+ function api(){ return (window.pywebview && window.pywebview.api) || null; }
+ let expanded=false, dragging=false, sx=0, startLeft=0, dpr=1, pending=null, raf=0;
+ function sessionPct(card){
+   if(!card||!card.limits) return null;
+   const s=card.limits.find(l=>/session/i.test(l.label));
+   return s?s.percent_left:null;
+ }
+ function fullCard(c){
+   let h='<div class="prov"><div class="ptitle"><span class="pname">'+c.name+'</span>'+
+     (c.plan?('<span class="plan">'+c.plan+'</span>'):'')+'</div><div class="card">';
+   if(c.limits&&c.limits.length){
+     h+='<div class="cap">Usage limit</div>';
+     for(const l of c.limits){
+       h+='<div class="limit"><div class="ltitle">'+l.label+'</div>'+
+          '<div class="bar"><div class="fill" style="width:'+l.percent_left+'%"></div></div>'+
+          '<div class="lmeta"><span>'+l.percent_left+'% left</span><span class="lreset">'+
+          (l.resets?('Resets in '+l.resets):'')+'</span></div></div>';
+     }
+     h+='<div class="sep"></div>';
+   } else if(c.hint){ h+='<div class="note">'+(NOTE[c.hint]||'')+'</div>'; }
+   h+='<div class="cap">Tokens used</div>';
+   for(const k of ['Today','Yesterday','Last 30 Days']){
+     const u=c.usage&&c.usage[k]; if(!u) continue;
+     const v=(u.tokens>0)?(ftok(u.tokens)+' tokens'):'—';
+     h+='<div class="urow"><span>'+k+'</span><span class="uval">'+v+'</span></div>';
+   }
+   return h+'</div></div>';
+ }
+ let lastData=null;
+ async function load(){
+   try{ lastData=await (await fetch('/data')).json(); }catch(e){ return; }
+   const c=lastData.cards&&lastData.cards[0], x=lastData.cards&&lastData.cards[1];
+   const cp=sessionPct(c), xp=sessionPct(x);
+   document.getElementById('cp').textContent=cp==null?'--':cp+'%';
+   document.getElementById('xp').textContent=xp==null?'--':xp+'%';
+   document.getElementById('cf').style.width=(cp==null?0:cp)+'%';
+   document.getElementById('xf').style.width=(xp==null?0:xp)+'%';
+   if(expanded) document.getElementById('full').innerHTML=lastData.cards.map(fullCard).join('');
+ }
+ // The native side resizes this window on hover (cursor-driven); the page just
+ // reacts to its own height to show/hide the full panel. No mouse events needed.
+ function applySize(){
+   const big = window.innerHeight > 100;
+   if(big && !expanded){
+     expanded=true;
+     if(lastData) document.getElementById('full').innerHTML=lastData.cards.map(fullCard).join('');
+     document.body.classList.add('open');
+   } else if(!big && expanded){
+     expanded=false;
+     document.body.classList.remove('open');
+   }
+ }
+ window.addEventListener('resize', applySize);
+ setInterval(applySize, 150);
+ const compact=document.getElementById('compact');
+ compact.addEventListener('mousedown', async e=>{
+   if(e.button!==0) return;
+   const a=api(); if(!a) return;
+   let r; try{ r=await a.begin_drag(); }catch(err){ return; }
+   if(!r || r[2]) return;                 // locked (via tray) -> no drag
+   expanded=false; document.body.classList.remove('open');
+   dragging=true; sx=e.screenX; startLeft=r[0]; dpr=r[1]||1;
+ });
+ function flush(){ raf=0; if(pending!=null){ const a=api(); if(a) a.drag_to(pending); } }
+ window.addEventListener('mousemove', e=>{
+   if(!dragging) return;
+   pending=startLeft+(e.screenX-sx)*dpr;
+   if(!raf) raf=requestAnimationFrame(flush);
+ });
+ window.addEventListener('mouseup', e=>{
+   if(!dragging) return; dragging=false;
+   const a=api(); const x=startLeft+(e.screenX-sx)*dpr;
+   if(a){ try{ a.end_drag(x); }catch(err){} }
+ });
+ window.addEventListener('pywebviewready', load);
+ load(); setInterval(load,__REFRESH__000);
+</script></body></html>"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -947,6 +1105,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path.startswith("/data"):
             body = json.dumps(build_cards()).encode("utf-8")
             ctype = "application/json"
+        elif self.path.startswith("/mini"):
+            body = (PAGE_MINI.replace("__REFRESH__", str(REFRESH_SECONDS))
+                             .replace("__BARH__", str(MINI_BAR_HEIGHT))).encode("utf-8")
+            ctype = "text/html; charset=utf-8"
         else:
             body = (PAGE.replace("__REFRESH__", str(REFRESH_SECONDS))
                         .replace("__FRACTION__", str(WINDOW_FRACTION))).encode("utf-8")
@@ -1007,11 +1169,163 @@ def run_claude_test():
 
 def primary_screen_height():
     """Primary screen height in logical pixels (~CSS px). 0 if it can't be read."""
+    return primary_screen_size()[1]
+
+
+def primary_screen_size():
+    """(width, height) of the primary screen in logical px, or (0, 0)."""
     try:
         import ctypes
-        return int(ctypes.windll.user32.GetSystemMetrics(1))  # SM_CYSCREEN
+        u = ctypes.windll.user32
+        return int(u.GetSystemMetrics(0)), int(u.GetSystemMetrics(1))
     except Exception:
-        return 0
+        return 0, 0
+
+
+def resource_path(name):
+    """Path to a bundled resource, working both from source and the PyInstaller exe."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+MINI_TITLE = "AI Usage (mini)"
+
+
+# --------------------------------------------------------------------------
+# Win32 layer for docking the mini gadget onto the taskbar (all PHYSICAL px, so
+# it's DPI-correct: we work in the same pixel space as the taskbar itself and
+# never mix with pywebview's logical coordinates).
+# --------------------------------------------------------------------------
+
+_WIN = None
+if os.name == "nt":
+    try:
+        import ctypes
+        from ctypes import wintypes
+        _WIN = ctypes.WinDLL("user32", use_last_error=True)
+        _WIN.FindWindowW.restype = wintypes.HWND
+        _WIN.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        _WIN.GetWindowRect.restype = wintypes.BOOL
+        _WIN.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        _WIN.SetWindowPos.restype = wintypes.BOOL
+        _WIN.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        _LONG_PTR = ctypes.c_longlong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_long
+        _GETL = getattr(_WIN, "GetWindowLongPtrW", _WIN.GetWindowLongW)
+        _SETL = getattr(_WIN, "SetWindowLongPtrW", _WIN.SetWindowLongW)
+        _GETL.restype = _LONG_PTR
+        _GETL.argtypes = [wintypes.HWND, ctypes.c_int]
+        _SETL.restype = _LONG_PTR
+        _SETL.argtypes = [wintypes.HWND, ctypes.c_int, _LONG_PTR]
+        _WIN.SetWindowTextW.restype = wintypes.BOOL
+        _WIN.SetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+        _WIN.GetCursorPos.restype = wintypes.BOOL
+        _WIN.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        try:
+            _WIN.GetDpiForWindow.restype = wintypes.UINT
+            _WIN.GetDpiForWindow.argtypes = [wintypes.HWND]
+        except Exception:
+            pass
+    except Exception:
+        _WIN = None
+
+_HWND_TOPMOST = -1
+_SWP_NOACTIVATE, _SWP_SHOWWINDOW = 0x0010, 0x0040
+_SWP_FRAMECHANGED, _SWP_NOMOVE, _SWP_NOSIZE, _SWP_NOZORDER = 0x0020, 0x0002, 0x0001, 0x0004
+_GWL_STYLE, _GWL_EXSTYLE = -16, -20
+_WS_EX_TOOLWINDOW, _WS_EX_TOPMOST = 0x00000080, 0x00000008
+# frame bits to strip so the widget is truly borderless (pywebview frameless can
+# be ignored by the WebView2 backend, leaving a title bar + a minimum size)
+_WS_CAPTION, _WS_THICKFRAME = 0x00C00000, 0x00040000
+_WS_MINIMIZEBOX, _WS_MAXIMIZEBOX, _WS_SYSMENU = 0x00020000, 0x00010000, 0x00080000
+
+
+def _tb_rect():
+    if not _WIN:
+        return None
+    h = _WIN.FindWindowW("Shell_TrayWnd", None)
+    if not h:
+        return None
+    r = wintypes.RECT()
+    if not _WIN.GetWindowRect(h, ctypes.byref(r)):
+        return None
+    return (r.left, r.top, r.right, r.bottom)
+
+
+def _mini_hwnd():
+    return _WIN.FindWindowW(None, MINI_TITLE) if _WIN else None
+
+
+def _hwnd_rect(hwnd):
+    r = wintypes.RECT()
+    if _WIN and hwnd and _WIN.GetWindowRect(hwnd, ctypes.byref(r)):
+        return (r.left, r.top, r.right, r.bottom)
+    return None
+
+
+def _dpi_scale(hwnd):
+    try:
+        return (_WIN.GetDpiForWindow(hwnd) or 96) / 96.0
+    except Exception:
+        return 1.0
+
+
+def _cursor():
+    if not _WIN:
+        return None
+    p = wintypes.POINT()
+    return (p.x, p.y) if _WIN.GetCursorPos(ctypes.byref(p)) else None
+
+
+def _pt_in(pt, g):
+    return bool(pt and g and g[0] <= pt[0] < g[0] + g[2] and g[1] <= pt[1] < g[1] + g[3])
+
+
+def _pt_in_rect(pt, r):
+    return bool(pt and r and r[0] <= pt[0] < r[2] and r[1] <= pt[1] < r[3])
+
+
+def _place(hwnd, x, y, w, h):
+    if _WIN and hwnd:
+        _WIN.SetWindowPos(hwnd, _HWND_TOPMOST, int(x), int(y), int(w), int(h),
+                          _SWP_NOACTIVATE | _SWP_SHOWWINDOW)
+
+
+def _style_widget(hwnd):
+    """Force the mini window borderless + no taskbar button (Win32), since the
+    WebView2 backend may ignore pywebview's frameless flag."""
+    if not (_WIN and hwnd):
+        return
+    st = _GETL(hwnd, _GWL_STYLE)
+    st &= ~(_WS_CAPTION | _WS_THICKFRAME | _WS_MINIMIZEBOX | _WS_MAXIMIZEBOX | _WS_SYSMENU)
+    _SETL(hwnd, _GWL_STYLE, st)
+    ex = _GETL(hwnd, _GWL_EXSTYLE)
+    _SETL(hwnd, _GWL_EXSTYLE, ex | _WS_EX_TOOLWINDOW | _WS_EX_TOPMOST)
+    try:
+        _WIN.SetWindowTextW(hwnd, "")     # drop the pointless "AI Usage (mini)" title
+    except Exception:
+        pass
+    _WIN.SetWindowPos(hwnd, _HWND_TOPMOST, 0, 0, 0, 0,
+                      _SWP_FRAMECHANGED | _SWP_NOMOVE | _SWP_NOSIZE | _SWP_NOACTIVATE)
+
+
+def taskbar_dock_loop(mini):
+    """Keep the gadget styled + docked, and drive hover expand/collapse from the
+    real cursor position (JS mouseenter/leave is unreliable for a topmost,
+    frameless window). Python is the single source of truth for the geometry."""
+    styled = False
+    while True:
+        try:
+            if mini and mini.visible:
+                hwnd = mini.hwnd()
+                if hwnd:
+                    if not styled:
+                        _style_widget(hwnd)
+                        styled = True
+                    mini.tick(hwnd)
+        except Exception:
+            pass
+        time.sleep(0.2)
 
 
 class WinApi:
@@ -1034,6 +1348,188 @@ class WinApi:
         return True
 
 
+class MiniController:
+    """js_api for the mini gadget AND its show/hide controller for the tray."""
+
+    def __init__(self):
+        self._window = None       # pywebview window (used only for show/hide)
+        self._visible = False
+        self._x = None            # desired compact LEFT in physical px (None = default)
+        self._expanded = False
+        self._dragging = False
+        self._hwnd = None         # cached native handle (title is cleared later)
+
+    def bind(self, window, visible, desired_x):
+        self._window = window
+        self._visible = visible
+        self._x = desired_x
+
+    def hwnd(self):
+        """Native window handle, found once by title then cached (the title is
+        cleared afterwards, so we must not rely on FindWindow again)."""
+        if not self._hwnd:
+            self._hwnd = _mini_hwnd()
+        return self._hwnd
+
+    @property
+    def visible(self):
+        return self._visible
+
+    @property
+    def busy(self):               # dock loop pauses while expanded/dragging
+        return self._expanded or self._dragging
+
+    # --- tray-side controls ---
+    def show(self):
+        if self._window:
+            try:
+                self._window.show()
+                self._visible = True
+                write_state(mini_enabled=True)
+            except Exception:
+                pass
+
+    def hide(self):
+        if self._window:
+            try:
+                self._window.hide()
+                self._visible = False
+                write_state(mini_enabled=False)
+            except Exception:
+                pass
+
+    def toggle(self):
+        self.hide() if self._visible else self.show()
+
+    # --- geometry helpers (physical px, taskbar coordinate space) ---
+    def _default_x(self, tb, scale):
+        return tb[0] + int(80 * scale)
+
+    def _compact_geom(self, hwnd, tb):
+        """(x, y, w, h) in physical px for the compact bar, centered on the taskbar."""
+        scale = _dpi_scale(hwnd)
+        w = int(MINI_WIDTH * scale)
+        barH = min(int(MINI_BAR_HEIGHT * scale), tb[3] - tb[1])
+        x = self._x if self._x is not None else self._default_x(tb, scale)
+        x = max(tb[0], min(int(x), tb[2] - w))
+        y = tb[1] + max(0, ((tb[3] - tb[1]) - barH) // 2)
+        return x, y, w, barH
+
+    def _expand_geom(self, hwnd, tb):
+        """(x, y, w, h) physical px for the expanded flyout (panel above the bar)."""
+        scale = _dpi_scale(hwnd)
+        cx, cy, _, barH = self._compact_geom(hwnd, tb)
+        w = int(MINI_EXPANDED_WIDTH * scale)
+        panel = int(MINI_EXPANDED_HEIGHT * scale)
+        x = max(0, min(cx, tb[2] - w))
+        y = max(0, cy - panel)                 # grow upward; bar's bottom unchanged
+        return x, y, w, panel + barH
+
+    def tick(self, hwnd):
+        """Runs ~5x/sec: keep the bar docked, and expand/collapse based on whether
+        the real cursor is over it. The page shows/hides its panel by watching its
+        own window height, so there's no Python<->JS state to get out of sync."""
+        if self._dragging:
+            return
+        tb = _tb_rect()
+        if not tb:
+            return
+        cur = _cursor()
+        if not self._expanded:
+            comp = self._compact_geom(hwnd, tb)
+            _place(hwnd, *comp)
+            if _pt_in(cur, comp):
+                self._expanded = True
+                _place(hwnd, *self._expand_geom(hwnd, tb))
+        else:
+            if not _pt_in_rect(cur, _hwnd_rect(hwnd)):
+                self._expanded = False
+                _place(hwnd, *self._compact_geom(hwnd, tb))
+
+    # --- js bridge (mini page) ---
+    def begin_drag(self):
+        # Lock is owned by the tray menu; check it here so it's always current.
+        if get_mini_settings()["locked"]:
+            return [0, 1.0, True]     # [_, _, locked]
+        self._dragging = True
+        self._expanded = False        # dragging always operates on the compact bar
+        hwnd = self.hwnd()
+        r = _hwnd_rect(hwnd)
+        return [r[0] if r else 0, _dpi_scale(hwnd), False]
+
+    def drag_to(self, x_phys):
+        hwnd, tb = self.hwnd(), _tb_rect()
+        if hwnd and tb:
+            scale = _dpi_scale(hwnd)
+            w = int(MINI_WIDTH * scale)
+            self._x = max(tb[0], min(int(x_phys), tb[2] - w))
+            _place(hwnd, *self._compact_geom(hwnd, tb))
+        return True
+
+    def end_drag(self, x_phys):
+        self.drag_to(x_phys)
+        self._dragging = False
+        if self._x is not None:
+            write_state(mini_x=int(self._x))
+        return True
+
+
+def build_tray(main_window, mini):
+    """System-tray icon: Open / toggle Mini widget / Exit."""
+    import pystray
+    from PIL import Image
+    try:
+        image = Image.open(resource_path("app.ico"))
+    except Exception:
+        image = Image.new("RGBA", (64, 64), (59, 130, 246, 255))
+
+    def on_open(icon, item):
+        try:
+            main_window.show()
+            main_window.restore()
+        except Exception:
+            pass
+
+    def on_toggle(icon, item):
+        mini.toggle()
+
+    def on_lock(icon, item):
+        write_state(mini_locked=not get_mini_settings()["locked"])
+
+    def on_exit(icon, item):
+        request_exit(icon, main_window, mini)
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open", on_open, default=True),
+        pystray.MenuItem("Taskbar widget", on_toggle, checked=lambda item: mini.visible),
+        pystray.MenuItem("Lock widget position", on_lock,
+                         checked=lambda item: get_mini_settings()["locked"]),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Exit", on_exit),
+    )
+    return pystray.Icon("ai_usage_monitor", image, "AI Usage Monitor", menu)
+
+
+_quitting = False
+_tray_active = False
+
+
+def request_exit(icon, main_window, mini):
+    global _quitting
+    _quitting = True
+    try:
+        if icon:
+            icon.stop()
+    except Exception:
+        pass
+    for w in (mini._window if mini else None, main_window):
+        try:
+            if w:
+                w.destroy()
+        except Exception:
+            pass
+
+
 def main():
     if "--test-claude" in sys.argv:
         run_claude_test()
@@ -1053,17 +1549,71 @@ def main():
         webview = None
     if webview is not None:
         try:
-            sh = primary_screen_height()
+            sw, sh = primary_screen_size()
             init_h = (max(WINDOW_MIN_HEIGHT, min(int(sh * WINDOW_FRACTION), WINDOW_MAX_HEIGHT))
                       if sh else WINDOW_HEIGHT)
+            global _tray_active
             api = WinApi()
             window = webview.create_window("AI Usage Monitor", url,
                                            width=WINDOW_WIDTH, height=init_h,
                                            resizable=False, on_top=ALWAYS_ON_TOP,
                                            js_api=api)
             api.bind(window)
+
+            # taskbar-overlay mini gadget. Its final geometry is driven by the
+            # Win32 dock loop (physical px, DPI-correct); the create_window values
+            # are just a small initial placeholder that gets snapped within ~1s.
+            ms = get_mini_settings()
+            mini = MiniController()
+            mini_window = webview.create_window("AI Usage (mini)", url + "/mini",
+                                                width=MINI_WIDTH, height=44,
+                                                x=120, y=120, frameless=True,
+                                                on_top=True, resizable=False,
+                                                easy_drag=False, focus=False,
+                                                background_color="#1e2025",
+                                                hidden=(not ms["enabled"]), js_api=mini)
+            mini.bind(mini_window, ms["enabled"], ms["x"])
+            threading.Thread(target=taskbar_dock_loop, args=(mini,), daemon=True).start()
+
+            # X on the main window minimizes to the tray. But if the tray failed
+            # to start, closing must FULLY quit (destroy the hidden mini too) so
+            # the app can never get stuck running with no visible window.
+            def on_closing():
+                global _quitting
+                if _quitting:
+                    return True
+                if _tray_active:
+                    try:
+                        window.hide()
+                    except Exception:
+                        pass
+                    return False
+                _quitting = True
+                try:
+                    mini_window.destroy()
+                except Exception:
+                    pass
+                return True
+            try:
+                window.events.closing += on_closing
+            except Exception:
+                pass
+
+            icon = None
+            try:
+                icon = build_tray(window, mini)
+                icon.run_detached()
+                _tray_active = True
+            except Exception:
+                icon = None
+
             webview.start()
-            return
+            try:
+                if icon:
+                    icon.stop()
+            except Exception:
+                pass
+            os._exit(0)
         except Exception:
             pass
     print("Opening the dashboard in your browser:", url)
